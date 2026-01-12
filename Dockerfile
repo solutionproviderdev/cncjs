@@ -1,54 +1,54 @@
-# BUILD STAGE
-FROM debian:bullseye as build-stage
+# Build Stage
+FROM node:18-bullseye as build
 
-ENV BUILD_DIR /tmp/build
-ENV NVM_DIR /root/.nvm
-ENV NODE_VERSION v18.20.4
-ENV NODE_ENV production
-ENV NODE_PATH $NVM_DIR/$NODE_VERSION/lib/node_modules
-ENV PATH $NVM_DIR/versions/node/$NODE_VERSION/bin:$PATH
+WORKDIR /app
 
-RUN apt-get update -y && apt-get install -y -q --no-install-recommends \
-  apt-utils \
-  build-essential \
-  ca-certificates \
-  python3 \
-  python3-pip \
-  curl \
-  git \
-  udev
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    build-essential \
+    udev \
+    git \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN git clone https://github.com/nvm-sh/nvm.git "$NVM_DIR" \
-  && cd "$NVM_DIR" \
-  && git checkout `git describe --abbrev=0 --tags --match "v[0-9]*" $(git rev-list --tags --max-count=1)` \
-  && . "$NVM_DIR/nvm.sh" \
-  && nvm install "$NODE_VERSION" \
-  && nvm alias default "$NODE_VERSION" \
-  && nvm use --delete-prefix default
+# Copy package files
+COPY package.json yarn.lock ./
 
-COPY ./dist/cncjs $BUILD_DIR/cncjs
-COPY ./entrypoint $BUILD_DIR/cncjs/
+# Install dependencies (ignoring scripts to avoid potential native module build issues immediately)
+# Then rebuild individually if needed, or just install. 
+# Based on previous attempts, standard yarn install works if environment is right.
+RUN yarn install --network-timeout 100000
 
-WORKDIR $BUILD_DIR/cncjs
-RUN npm install -g yarn && yarn --production
+# Copy source code
+COPY . .
 
-# FINAL STAGE
-FROM debian:bullseye
+# Build the application
+RUN yarn run build-prod
 
-ENV NVM_DIR /root/.nvm
-ENV NODE_VERSION v18.20.4
-ENV NODE_ENV production
-ENV NODE_PATH $NVM_DIR/$NODE_VERSION/lib/node_modules
-ENV PATH $NVM_DIR/versions/node/$NODE_VERSION/bin:$PATH
+# Prune dev dependencies to save space (optional but good practice)
+RUN yarn install --production --ignore-scripts --prefer-offline
 
-RUN apt-get update -y && apt-get install -y -q --no-install-recommends \
-  apt-utils \
-  ca-certificates \
-  udev
+# Production Stage
+FROM node:18-bullseye-slim
 
-WORKDIR /opt/cncjs
+WORKDIR /app
+
+# Install runtime dependencies (udev is often needed for serial port, though inside docker generic serial might strictly not work without privileges)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    udev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Copy built assets and necessary files from build stage
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/package.json ./
+COPY --from=build /app/bin ./bin
+
+# Expose port
 EXPOSE 8000
-ENTRYPOINT ["/opt/cncjs/entrypoint"]
 
-COPY --from=build-stage /root/.nvm $NVM_DIR
-COPY --from=build-stage /tmp/build/cncjs /opt/cncjs
+# Set environment
+ENV NODE_ENV=production
+
+# Start command
+CMD ["node", "bin/cncjs"]
